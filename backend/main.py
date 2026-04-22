@@ -23,6 +23,12 @@ PG_PASSWORD = os.getenv("PG_PASSWORD", "")
 
 API_KEY_RPI = os.getenv("API_KEY_RPI", "")
 ENV = os.getenv("ENV", "development")
+
+# Cambio 7: los límites del pool se pueden configurar por variable de entorno
+# sin tocar el código. Útil para ajustar según el plan de PostgreSQL en Render.
+PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "2"))
+PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "10"))
+
 # ===================== MEMORIA =====================
 estado_actual_por_ambiente: Dict[str, dict] = {}
 
@@ -30,16 +36,21 @@ estado_actual_por_ambiente: Dict[str, dict] = {}
 app = FastAPI(
     title="API de Monitoreo Ambiental",
     description="Backend modular para monitoreo y supervisión de ambientes de cultivo",
-    version="3.0.0"
+    version="3.1.0",
 )
 
+# Cambio 8: el pool se inicializa con el objeto controlador. No se abre ninguna
+# conexión en cada request — se toma una del pool y se devuelve al terminar.
 controlador = ControladorAmbiente(
     host=PG_HOST,
     port=PG_PORT,
     dbname=PG_DBNAME,
     user=PG_USER,
     password=PG_PASSWORD,
+    min_conn=PG_POOL_MIN,
+    max_conn=PG_POOL_MAX,
 )
+
 
 # ===================== MODELOS DE ENTRADA =====================
 class EventoTelemetria(BaseModel):
@@ -93,6 +104,9 @@ class RegistroHistoricoResponse(BaseModel):
     temperatura: Optional[float] = None
     humedad: Optional[float] = None
     co2: Optional[float] = None
+    # Cambio 9: estos campos se mantienen en el modelo para no romper
+    # la compatibilidad con el frontend existente. El controlador los rellena
+    # con False cuando no hay datos de actuador en el historial de sensores.
     estado_calefactor: bool
     estado_extractor: bool
     estado_nebulizador: bool
@@ -100,23 +114,35 @@ class RegistroHistoricoResponse(BaseModel):
     timestamp: datetime
 
 
+class HistorialActuadorResponse(BaseModel):
+    """Modelo nuevo para el endpoint de historial de actuadores."""
+    ambiente_id: str
+    actuador: str
+    timestamp: datetime
+    estado: Literal["ON", "OFF"]
+    modo: Optional[str] = None
+
+
 class MensajeResponse(BaseModel):
     status: str
     message: str
+
+
+# ===================== SEGURIDAD =====================
 def verificar_api_key_rpi(x_api_key: str = Header(...)):
     if not API_KEY_RPI:
         logger.error("API_KEY_RPI no está configurada en el entorno.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Configuración de seguridad incompleta"
+            detail="Configuración de seguridad incompleta",
         )
-
     if x_api_key != API_KEY_RPI:
         logger.warning("Intento de acceso con API key inválida en /telemetria")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API key inválida"
+            detail="API key inválida",
         )
+
 
 # ===================== EVENTOS =====================
 @app.on_event("startup")
@@ -134,6 +160,7 @@ def construir_estado_ambiente(data: EventoTelemetria):
     """
     Actualiza el cache en memoria del estado actual por ambiente.
     Soporta múltiples puntos de medición por ambiente.
+    Sin cambios de lógica — ya era correcto y eficiente (O(1), en memoria).
     """
     ambiente_id = data.ambiente_id
 
@@ -168,19 +195,17 @@ def construir_estado_ambiente(data: EventoTelemetria):
 
 
 def serializar_estado_ambiente(estado: dict) -> dict:
-    sensores_list = []
-    for sensor in estado["sensores"].values():
-        sensores_list.append(
-            {
-                "sensor_id": sensor["sensor_id"],
-                "temperatura": sensor["temperatura"],
-                "humedad": sensor["humedad"],
-                "co2": sensor["co2"],
-                "estado_sensor": sensor["estado_sensor"],
-                "timestamp": sensor["timestamp"],
-            }
-        )
-
+    sensores_list = [
+        {
+            "sensor_id": sensor["sensor_id"],
+            "temperatura": sensor["temperatura"],
+            "humedad": sensor["humedad"],
+            "co2": sensor["co2"],
+            "estado_sensor": sensor["estado_sensor"],
+            "timestamp": sensor["timestamp"],
+        }
+        for sensor in estado["sensores"].values()
+    ]
     return {
         "ambiente_id": estado["ambiente_id"],
         "sensores": sensores_list,
@@ -189,10 +214,13 @@ def serializar_estado_ambiente(estado: dict) -> dict:
     }
 
 
-# ===================== ENDPOINTS ESTADO ACTUAL =====================
-# Importante: las rutas fijas van antes que /ambientes/{ambiente_id}
+# ===================== ENDPOINTS ESTADO ACTUAL (cache en memoria) =====================
 @app.get("/ambientes/estado", response_model=List[EstadoAmbienteResponse])
 def listar_estado_actual():
+    """
+    O(1) — responde directamente desde el diccionario en memoria.
+    No toca la base de datos.
+    """
     try:
         return [
             serializar_estado_ambiente(estado)
@@ -205,9 +233,12 @@ def listar_estado_actual():
 
 @app.get("/ambientes/{ambiente_id}/estado", response_model=EstadoAmbienteResponse)
 def obtener_estado_actual_ambiente(ambiente_id: str):
+    """O(1) — cache en memoria. No toca la base de datos."""
     if ambiente_id not in estado_actual_por_ambiente:
-        raise HTTPException(status_code=404, detail="No existe estado actual para este ambiente")
-
+        raise HTTPException(
+            status_code=404,
+            detail="No existe estado actual para este ambiente",
+        )
     try:
         return serializar_estado_ambiente(estado_actual_por_ambiente[ambiente_id])
     except Exception as e:
@@ -243,14 +274,13 @@ def obtener_ambiente(ambiente_id: str):
 @app.post("/telemetria", response_model=MensajeResponse)
 async def registrar_telemetria(
     data: EventoTelemetria,
-    _: None = Depends(verificar_api_key_rpi)
+    _: None = Depends(verificar_api_key_rpi),
 ):
     try:
         if data.estado_sensor == "ERROR":
             logger.warning(
                 f"Sensor con falla: sensor={data.sensor_id}, ambiente={data.ambiente_id}"
             )
-
         if data.estado_sensor == "DESCONEXION":
             logger.warning(
                 f"Sensor desconectado: sensor={data.sensor_id}, ambiente={data.ambiente_id}"
@@ -271,10 +301,7 @@ async def registrar_telemetria(
             estado_sensor=data.estado_sensor,
         )
 
-        return {
-            "status": "registrado",
-            "message": "Telemetría almacenada correctamente",
-        }
+        return {"status": "registrado", "message": "Telemetría almacenada correctamente"}
 
     except ValueError as e:
         logger.error(f"Datos inválidos al registrar telemetría: {e}")
@@ -284,8 +311,11 @@ async def registrar_telemetria(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===================== ENDPOINTS HISTORIAL =====================
-@app.get("/ambientes/{ambiente_id}/historial", response_model=List[RegistroHistoricoResponse])
+# ===================== ENDPOINTS HISTORIAL DE SENSORES =====================
+@app.get(
+    "/ambientes/{ambiente_id}/historial",
+    response_model=List[RegistroHistoricoResponse],
+)
 def obtener_historial_ambiente(
     ambiente_id: str,
     variable: Optional[Literal["temperatura", "humedad", "co2"]] = Query(None),
@@ -293,6 +323,13 @@ def obtener_historial_ambiente(
     desde: Optional[datetime] = Query(None),
     hasta: Optional[datetime] = Query(None),
 ):
+    """
+    Cambio 10: el límite por defecto bajó de 200 a 200 (igual), pero el
+    máximo permitido sigue en 5000. Si el frontend pedía 500+ sin filtro de
+    variable, recomendamos que lo baje a 200 por defecto.
+
+    La query ya no tiene LATERAL — ver controlador.py.
+    """
     try:
         historial = controlador.obtener_historial_sensores(
             ambiente_id=ambiente_id,
@@ -301,10 +338,8 @@ def obtener_historial_ambiente(
             desde=desde,
             hasta=hasta,
         )
-
         if historial is None:
             raise HTTPException(status_code=404, detail="Ambiente no encontrado")
-
         return historial
     except HTTPException:
         raise
@@ -330,4 +365,45 @@ def obtener_historial_global(
         )
     except Exception as e:
         logger.error(f"Error al consultar historial global: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== ENDPOINT HISTORIAL DE ACTUADORES (nuevo) =====================
+@app.get(
+    "/ambientes/{ambiente_id}/actuadores/historial",
+    response_model=List[HistorialActuadorResponse],
+)
+def obtener_historial_actuadores(
+    ambiente_id: str,
+    limite: int = Query(200, ge=1, le=1000),
+    desde: Optional[datetime] = Query(None),
+    hasta: Optional[datetime] = Query(None),
+):
+    """
+    Nuevo endpoint separado para el historial de actuadores.
+
+    Por qué separarlo:
+    - Los actuadores cambian de estado con poca frecuencia (decenas de eventos
+      por día), mientras que los sensores generan miles de lecturas.
+    - Cruzar ambos en una sola query es el origen del timeout. Separados,
+      cada query es simple y usa índices directos.
+    - El frontend puede pedir ambos en paralelo si necesita mostrarlos juntos,
+      o solo el que necesita en cada pestaña.
+    """
+    try:
+        historial = controlador.obtener_historial_actuadores(
+            ambiente_id=ambiente_id,
+            limite=limite,
+            desde=desde,
+            hasta=hasta,
+        )
+        if historial is None:
+            raise HTTPException(status_code=404, detail="Ambiente no encontrado")
+        return historial
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error al consultar historial de actuadores del ambiente {ambiente_id}: {e}"
+        )
         raise HTTPException(status_code=500, detail=str(e))
